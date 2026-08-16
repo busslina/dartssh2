@@ -7,6 +7,8 @@ abstract class SSHAlgorithm {
   /// The name of the algorithm.
   String get name;
 
+  const SSHAlgorithm();
+
   @override
   String toString() {
     return '$runtimeType($name)';
@@ -43,6 +45,7 @@ class SSHAlgorithms {
 
   const SSHAlgorithms({
     this.kex = const [
+      SSHKexType.x25519Rfc,
       SSHKexType.x25519,
       SSHKexType.nistp521,
       SSHKexType.nistp384,
@@ -69,6 +72,10 @@ class SSHAlgorithms {
       SSHCipherType.aes256cbc,
     ],
     this.mac = const [
+      SSHMacType.hmacSha256_96,
+      SSHMacType.hmacSha512_96,
+      SSHMacType.hmacSha256Etm,
+      SSHMacType.hmacSha512Etm,
       SSHMacType.hmacSha1,
       SSHMacType.hmacSha256,
       SSHMacType.hmacSha512,

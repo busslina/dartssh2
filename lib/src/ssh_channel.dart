@@ -31,6 +31,8 @@ class SSHChannelController {
 
   SSHChannel get channel => SSHChannel(this);
 
+  final Future<void> Function()? onFlush;
+
   SSHChannelController({
     required this.localId,
     required this.localMaximumPacketSize,
@@ -39,6 +41,7 @@ class SSHChannelController {
     required this.remoteInitialWindowSize,
     required this.remoteMaximumPacketSize,
     required this.sendMessage,
+    this.onFlush,
     this.printDebug,
   }) {
     if (remoteInitialWindowSize > 0) {
@@ -120,6 +123,36 @@ class SSHChannelController {
     return await _requestReplyQueue.next;
   }
 
+  Future<bool> sendX11Req({
+    bool singleConnection = false,
+    String authenticationProtocol = 'MIT-MAGIC-COOKIE-1',
+    required String authenticationCookie,
+    int screenNumber = 0,
+  }) async {
+    sendMessage(
+      SSH_Message_Channel_Request.x11(
+        recipientChannel: remoteId,
+        wantReply: true,
+        singleConnection: singleConnection,
+        x11AuthenticationProtocol: authenticationProtocol,
+        x11AuthenticationCookie: authenticationCookie,
+        x11ScreenNumber: screenNumber.toString(),
+      ),
+    );
+    return await _requestReplyQueue.next;
+  }
+
+  Future<bool> sendAgentForwardingRequest() async {
+    sendMessage(
+      SSH_Message_Channel_Request(
+        recipientChannel: remoteId,
+        requestType: SSHChannelRequestType.authAgent,
+        wantReply: true,
+      ),
+    );
+    return await _requestReplyQueue.next;
+  }
+
   Future<bool> sendSubsystem(String subsystem) async {
     sendMessage(
       SSH_Message_Channel_Request.subsystem(
@@ -131,7 +164,7 @@ class SSHChannelController {
     return await _requestReplyQueue.next;
   }
 
-  void sendEnv(String name, String value) {
+  Future<bool> sendEnv(String name, String value) async {
     sendMessage(
       SSH_Message_Channel_Request.env(
         recipientChannel: remoteId,
@@ -140,6 +173,7 @@ class SSHChannelController {
         wantReply: true,
       ),
     );
+    return await _requestReplyQueue.next;
   }
 
   void sendSignal(String signal) {
@@ -297,7 +331,12 @@ class SSHChannelController {
     if (_done.isCompleted) return;
     if (_hasSentClose) return;
     _hasSentClose = true;
-    sendMessage(SSH_Message_Channel_Close(recipientChannel: remoteId));
+
+    try {
+      sendMessage(SSH_Message_Channel_Close(recipientChannel: remoteId));
+    } catch (e) {
+      printDebug?.call('SSHChannelController._sendCloseIfNeeded - error: $e');
+    }
   }
 
   void _sendRequestSuccess() {
@@ -368,6 +407,10 @@ class SSHChannelController {
       _remoteWindow -= data.bytes.length;
     }
   });
+
+  Future<void> flush() async {
+    await onFlush?.call();
+  }
 }
 
 class SSHChannel {
@@ -398,6 +441,9 @@ class SSHChannel {
     sink.add(SSHChannelData(data, type: type));
   }
 
+  /// Force flush any buffered outgoing data on this channel to the socket.
+  Future<void> flush() => _controller.flush();
+
   void setRequestHandler(SSHChannelRequestHandler handler) {
     _controller._requestHandler = handler;
   }
@@ -408,6 +454,20 @@ class SSHChannel {
 
   Future<bool> sendShell() async {
     return await _controller.sendShell();
+  }
+
+  Future<bool> sendX11Req({
+    bool singleConnection = false,
+    String authenticationProtocol = 'MIT-MAGIC-COOKIE-1',
+    required String authenticationCookie,
+    int screenNumber = 0,
+  }) async {
+    return await _controller.sendX11Req(
+      singleConnection: singleConnection,
+      authenticationProtocol: authenticationProtocol,
+      authenticationCookie: authenticationCookie,
+      screenNumber: screenNumber,
+    );
   }
 
   void sendTerminalWindowChange({

@@ -1,9 +1,18 @@
 import 'package:dartssh2/src/ssh_algorithm.dart';
 import 'package:pointycastle/export.dart';
 
-class SSHKexType with SSHAlgorithm {
+class SSHKexType extends SSHAlgorithm {
   static const x25519 = SSHKexType._(
     name: 'curve25519-sha256@libssh.org',
+    digestFactory: digestSha256,
+  );
+
+  /// RFC 8731 name for the same algorithm as [x25519]. Servers hardened to a
+  /// single kex commonly offer only this spelling, and OpenSSH matches names
+  /// literally — without it the handshake dies with "no matching key exchange
+  /// method found".
+  static const x25519Rfc = SSHKexType._(
+    name: 'curve25519-sha256',
     digestFactory: digestSha256,
   );
 

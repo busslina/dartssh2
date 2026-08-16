@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -17,7 +18,13 @@ import 'package:dartssh2/src/ssh_transport.dart';
 import 'package:dartssh2/src/utils/chunk_buffer.dart';
 import 'package:dartssh2/src/ssh_message.dart';
 
+part 'sftp_file.dart';
+
 const _kVersion = 3;
+const _kReadChunkSize = 16 * 1024;
+const _kReadMaxPendingRequests = 64;
+const _kDownloadChunkSize = 64 * 1024;
+const _kDownloadMaxPendingRequests = 128;
 
 class SftpClient {
   final SSHChannel _channel;
@@ -68,6 +75,38 @@ class SftpClient {
     if (reply is SftpHandlePacket) return SftpFile(this, reply.handle);
     if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
     throw SftpStatusError.fromStatus(reply);
+  }
+
+  /// Downloads a remote file from [path] into [destination].
+  ///
+  /// This is a convenience API built on top of [SftpFile.read] and keeps the
+  /// existing stream-based APIs fully compatible.
+  ///
+  /// Returns the total number of bytes written.
+  Future<int> download(
+    String path,
+    StreamSink<List<int>> destination, {
+    int? length,
+    int offset = 0,
+    void Function(int bytesRead)? onProgress,
+    int chunkSize = _kDownloadChunkSize,
+    int maxPendingRequests = _kDownloadMaxPendingRequests,
+    bool closeDestination = false,
+  }) async {
+    final file = await open(path, mode: SftpFileOpenMode.read);
+    try {
+      return await file.downloadTo(
+        destination,
+        length: length,
+        offset: offset,
+        onProgress: onProgress,
+        chunkSize: chunkSize,
+        maxPendingRequests: maxPendingRequests,
+        closeDestination: closeDestination,
+      );
+    } finally {
+      await file.close();
+    }
   }
 
   /// Reads the items of a directory. Returns an [Stream] of [SftpName] chunks.
@@ -126,7 +165,29 @@ class SftpClient {
   }
 
   /// Renames a file or directory from [oldPath] to [newPath].
+  ///
+  /// If the server supports the `posix-rename@openssh.com` SFTP extension
+  /// (version "1"), this method uses it to perform an atomic rename with
+  /// POSIX semantics (replace destination if it exists). Otherwise, it falls
+  /// back to the standard SFTP `SSH_FXP_RENAME` request.
   Future<void> rename(String oldPath, String newPath) async {
+    // Prefer OpenSSH's posix-rename extension when available.
+    final hs = await handshake;
+    final extVersion = hs.extensions['posix-rename@openssh.com'];
+    if (extVersion != null) {
+      try {
+        await _checkExtension('posix-rename@openssh.com', '1');
+        final payload =
+            SftpPosixRenameRequest(oldPath: oldPath, newPath: newPath);
+        final reply = await _sendExtended(payload);
+        if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
+        SftpStatusError.check(reply);
+        return;
+      } on SftpExtensionError {
+        // Fall through to standard rename if extension unsupported/mismatched.
+      }
+    }
+
     final reply = await _sendRename(oldPath, newPath);
     if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
     SftpStatusError.check(reply);
@@ -169,12 +230,20 @@ class SftpClient {
   }
 
   /// Close the sftp session.
-  void close() {
+  ///
+  /// This also closes the underlying SSH channel that the sftp subsystem runs
+  /// on. Without this the channel is leaked: every [SSHClient.sftp] call opens
+  /// a fresh session channel, so an application that opens an sftp session per
+  /// operation would accumulate open channels on the connection until the
+  /// server refuses further `CHANNEL_OPEN`s.
+  Future<void> close() async {
+    if (_done.isCompleted) return;
     for (var waiter in _replyWaiters.values) {
       waiter.completeError(SftpAbortError("Connection closed"));
     }
     _replyWaiters.clear();
     _done.complete();
+    await _channel.close();
   }
 
   void _closeError(Object error, [StackTrace? stackTrace]) {
@@ -502,220 +571,4 @@ class SftpClient {
     printTrace?.call('<- $_channel: $packet');
     _dispatchReply(packet);
   }
-}
-
-class SftpFile {
-  final Uint8List _handle;
-
-  final SftpClient _client;
-
-  SftpFile(this._client, this._handle);
-
-  var _isClosed = false;
-
-  bool get isClosed => _isClosed;
-
-  Future<void> close() async {
-    if (_isClosed) return;
-    _isClosed = true;
-    await _client._close(_handle);
-  }
-
-  Future<SftpFileAttrs> stat() async {
-    _mustNotBeClosed();
-    final reply = await _client._sendFStat(_handle);
-    if (reply is SftpAttrsPacket) return reply.attrs;
-    if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
-    throw SftpStatusError.fromStatus(reply);
-  }
-
-  Future<void> setStat(SftpFileAttrs attrs) async {
-    _mustNotBeClosed();
-    final reply = await _client._sendFSetStat(_handle, attrs);
-    if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
-    SftpStatusError.check(reply);
-  }
-
-  /// Reads at most [count] bytes from the file starting at [offset]. If
-  /// [length] is null, reads until end of file.  Returns a [Stream] of chunks.
-  /// [onProgress] is called with the total number of bytes already read.
-  /// Use [readBytes] if you want a single Uint8List.
-  Stream<Uint8List> read({
-    int? length,
-    int offset = 0,
-    void Function(int bytesRead)? onProgress,
-  }) async* {
-    const chunkSize = 16 * 1024;
-    const maxBytesOnTheWire = chunkSize * 64;
-
-    // Get the file size if not specified.
-    if (length == null) {
-      final fileStat = await stat();
-      final fileSize = fileStat.size;
-
-      if (fileSize == null) {
-        throw SftpError('Can not get file size');
-      }
-
-      length = fileSize - offset;
-    }
-
-    if (length == 0) return;
-
-    if (length < 0) {
-      throw SftpError('Length must be positive: $length');
-    }
-
-    final streamController = StreamController<Uint8List>();
-
-    var bytessRecieved = 0;
-    var bytessRequested = 0;
-
-    Future<void> readChunk(int chunkStart) async {
-      final chunkEnd = min(chunkStart + chunkSize, offset + length!);
-      final chunkLength = chunkEnd - chunkStart;
-
-      bytessRequested += chunkLength;
-
-      late final Uint8List? chunk;
-
-      try {
-        chunk = await _readChunk(chunkLength, chunkStart);
-      } catch (e, st) {
-        if (!streamController.isClosed) {
-          streamController.addError(e, st);
-          streamController.close();
-        }
-        return;
-      }
-
-      if (chunk == null) {
-        streamController.close();
-        return;
-      }
-
-      streamController.add(chunk);
-      bytessRecieved += chunkLength;
-
-      if (onProgress != null) onProgress(bytessRecieved);
-
-      if (bytessRecieved >= length) {
-        streamController.close();
-        return;
-      }
-    }
-
-    void scheduleRead() {
-      if (streamController.isPaused || streamController.isClosed) {
-        return;
-      }
-
-      while (bytessRequested < length!) {
-        final bytesOnTheWire = bytessRequested - bytessRecieved;
-        if (bytesOnTheWire >= maxBytesOnTheWire) return;
-        readChunk(bytessRequested + offset).then((_) => scheduleRead());
-      }
-    }
-
-    streamController.onListen = scheduleRead;
-    streamController.onResume = scheduleRead;
-
-    yield* streamController.stream;
-  }
-
-  /// Reads at most [length] bytes from the file starting at [offset]. If
-  /// [length] is null, reads until end of the file.
-  /// Use [read] if you want to stream large file in chunks.
-  Future<Uint8List> readBytes({int? length, int offset = 0}) async {
-    final buffer = BytesBuilder(copy: false);
-    await for (final chunk in read(length: length, offset: offset)) {
-      buffer.add(chunk);
-    }
-    return buffer.takeBytes();
-  }
-
-  /// Writes [stream] to the file starting at [offset].
-  ///
-  /// Returns a [SftpFileWriter] that can be used to control the write
-  /// operation or wait for it to complete.
-  SftpFileWriter write(
-    Stream<Uint8List> stream, {
-    int offset = 0,
-    void Function(int total)? onProgress,
-  }) {
-    return SftpFileWriter(this, stream, offset, onProgress);
-  }
-
-  /// Writes [data] to the file starting at [offset].
-  Future<void> writeBytes(Uint8List data, {int offset = 0}) async {
-    const maxChunkSize = 16 * 1024;
-    var bytesSent = 0;
-    final futures = <Future<void>>[];
-    while (bytesSent < data.length) {
-      final chunkSize = min(data.length - bytesSent, maxChunkSize);
-      final chunkBegin = bytesSent;
-      final chunkEnd = chunkBegin + chunkSize;
-      final chunk = Uint8List.sublistView(data, chunkBegin, chunkEnd);
-      futures.add(_writeChunk(chunk, offset: offset + bytesSent));
-      bytesSent += chunkSize;
-    }
-    await Future.wait(futures);
-  }
-
-  /// Gets filesystem statistics that this file is on.
-  ///
-  /// **Note**: This is an extension to the SFTP protocol, supported by most
-  /// openssh servers. A [SftpExtensionError] is thrown if the server does not
-  /// support this extension.
-  ///
-  /// See also:
-  ///
-  /// * [SftpClient.statvfs] which takes a path instead of a file handle as
-  ///   argument.
-  Future<SftpStatVfs> statvfs() async {
-    _mustNotBeClosed();
-    await _client._checkExtension('fstatvfs@openssh.com', '2');
-    final payload = SftpFstatVfsRequest(handle: _handle);
-    final reply = await _client._sendExtended(payload);
-    if (reply is SftpStatusPacket) throw SftpStatusError.fromStatus(reply);
-    if (reply is! SftpExtendedReplyPacket) throw SftpError('Unexpected reply');
-    final stat = SftpStatVfsReply.decode(reply.payload);
-    return SftpStatVfs.fromReply(stat);
-  }
-
-  Future<void> _writeChunk(Uint8List data, {int offset = 0}) async {
-    // print('_writeChunk: offset=$offset');
-    _mustNotBeClosed();
-    final reply = await _client._sendWrite(_handle, offset, data);
-    if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
-    SftpStatusError.check(reply);
-  }
-
-  Future<Uint8List?> _readChunk(int length, [int offset = 0]) async {
-    _mustNotBeClosed();
-    final reply = await _client._sendRead(_handle, offset, length);
-    if (reply is SftpDataPacket) return reply.data;
-    if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
-    SftpStatusError.check(reply);
-    return null;
-  }
-
-  void _mustNotBeClosed() {
-    if (isClosed) throw SftpError('File is closed');
-  }
-
-  @override
-  String toString() => 'SftpFile(0x${hex.encode(_handle)})';
-}
-
-/// Handsake information received from the server.
-class SftpHandsake {
-  final int version;
-
-  final Map<String, String> extensions;
-
-  SftpHandsake(this.version, this.extensions);
-
-  @override
-  String toString() => 'SftpHandsake($version, $extensions)';
 }

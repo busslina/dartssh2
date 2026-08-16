@@ -31,11 +31,18 @@ typedef SSHPrintHandler = void Function(String?);
 
 /// Function called when host key is received.
 /// [type] is the type of the host key, For example 'ssh-rsa',
-/// [fingerprint] md5 fingerprint of the host key.
+/// [fingerprint] OpenSSH-style SHA256 fingerprint of the host key,
+/// UTF-8 encoded as `SHA256:<base64>`.
 typedef SSHHostkeyVerifyHandler = FutureOr<bool> Function(
   String type,
   Uint8List fingerprint,
 );
+
+Uint8List _hostkeyFingerprint(Uint8List hostkey) {
+  final fingerprint = SHA256Digest().process(hostkey);
+  final encoded = base64.encode(fingerprint).replaceAll('=', '');
+  return Uint8List.fromList(utf8.encode('SHA256:$encoded'));
+}
 
 typedef SSHTransportReadyHandler = void Function();
 
@@ -60,6 +67,7 @@ class SSHTransport {
   /// Function invoked with trace logging.
   final SSHPrintHandler? printTrace;
 
+  /// The collection of cryptographic and transport algorithms to negotiate and use.
   final SSHAlgorithms algorithms;
 
   /// Function called when the hostkey has been received. Returns true if the
@@ -71,6 +79,12 @@ class SSHTransport {
 
   /// Function called when a packet is received.
   final SSHPacketHandler? onPacket;
+
+  /// Whether to bypass server host key verification.
+  ///
+  /// If set to `true`, the connection will proceed without checking the server's
+  /// host key signature or identity, which is useful for testing but insecure.
+  final bool disableHostkeyVerification;
 
   /// A [Future] that completes when the transport is closed, or when an error
   /// occurs. After this [Future] completes, [isClosed] will be true and no
@@ -94,11 +108,14 @@ class SSHTransport {
     this.onVerifyHostKey,
     this.onReady,
     this.onPacket,
+    this.disableHostkeyVerification = false,
   }) {
     _initSocket();
     _startHandshake();
   }
 
+  /// A completer that completes when the transport is closed or terminated,
+  /// either normally or due to an error.
   final _doneCompleter = Completer<void>();
 
   /// Contains unprocessed data from the socket.
@@ -110,6 +127,12 @@ class SSHTransport {
   /// Subscription to the socket's [Stream]. It should be closed when the
   /// transport is closed.
   StreamSubscription? _socketSubscription;
+
+  /// Guards asynchronous packet processing to preserve message order.
+  var _isProcessingData = false;
+
+  /// Tracks whether new socket data was received since packet processing started.
+  var _hasNewData = false;
 
   /// Identification string sent by us without trailing \r\n. For example,
   /// "SSH-2.0-DartSSH_2.0".
@@ -128,23 +151,34 @@ class SSHTransport {
   /// compute the exchange hash.
   late Uint8List _remoteKexInit;
 
+  /// The selected key exchange algorithm type negotiated between the parties.
   SSHKexType? _kexType;
 
+  /// The selected server host key algorithm type negotiated between the parties.
   SSHHostkeyType? _hostkeyType;
 
+  /// The encryption cipher algorithm type selected for client-to-server communication.
   SSHCipherType? _clientCipherType;
 
+  /// The decryption cipher algorithm type selected for server-to-client communication.
   SSHCipherType? _serverCipherType;
 
+  /// The MAC algorithm type selected for client-to-server integrity verification.
   SSHMacType? _clientMacType;
 
+  /// The MAC algorithm type selected for server-to-client integrity verification.
   SSHMacType? _serverMacType;
 
+  /// The active key exchange algorithm implementation instance.
   SSHKex? _kex;
 
   /// [_exchangeHash] of the first key exchange is used as session identifier.
   /// Used to derive the cipher IV, cipher key and MAC key.
   Uint8List? _sessionId;
+
+  // ignore: unnecessary_getters_setters
+  Uint8List? get sessionId => _sessionId;
+  set sessionId(Uint8List? value) => _sessionId = value;
 
   /// A hash value of various parameters (defined in rfc4253). Kept to derive the
   /// cipher IV, cipher key and MAC key.
@@ -164,52 +198,267 @@ class SSHTransport {
   /// A [BlockCipher] to decrypt data sent from the other side.
   BlockCipher? _decryptCipher;
 
+  /// The cipher key derived for encrypting outgoing data.
+  Uint8List? _localCipherKey;
+
+  /// The cipher key derived for decrypting incoming data.
+  Uint8List? _remoteCipherKey;
+
+  /// The initialization vector (IV) or nonce prefix derived for encrypting outgoing data.
+  Uint8List? _localIV;
+
+  /// The initialization vector (IV) or nonce prefix derived for decrypting incoming data.
+  Uint8List? _remoteIV;
+
   /// A [Mac] used to authenticate data sent to the other side.
   Mac? _localMac;
 
   /// A [Mac] used to authenticate data sent from the other side.
   Mac? _remoteMac;
 
+  /// The monotonic sequence number of local packets sent over this transport.
+  /// Used for MAC computation and standard packet flow tracing.
   final _localPacketSN = SSHPacketSN.fromZero();
 
+  /// The monotonic sequence number of remote packets received over this transport.
+  /// Used for MAC verification and standard packet flow tracing.
   final _remotePacketSN = SSHPacketSN.fromZero();
 
+  /// The invocation counter for local AEAD (e.g. AES-GCM) packets.
+  ///
+  /// According to RFC 5647 Section 7.1, the invocation counter (used to derive
+  /// the AEAD nonce) must reset to zero when new keys are established (NEWKEYS).
+  /// This counter is used instead of [_localPacketSN], which is monotonic
+  /// across the entire SSH session and does not reset on rekey.
+  int _localAeadPacketCount = 0;
+
+  /// The invocation counter for remote AEAD (e.g. AES-GCM) packets.
+  ///
+  /// According to RFC 5647 Section 7.1, the invocation counter (used to derive
+  /// the AEAD nonce) must reset to zero when new keys are established (NEWKEYS).
+  /// This counter is used instead of [_remotePacketSN], which is monotonic
+  /// across the entire SSH session and does not reset on rekey.
+  int _remoteAeadPacketCount = 0;
+
+  /// Whether a key exchange is currently in progress (initial or re-key).
+  bool _kexInProgress = false;
+
+  /// Whether we have already sent our SSH_MSG_KEXINIT for the ongoing key
+  /// exchange round. This is reset when the exchange finishes.
+  bool _sentKexInit = false;
+
+  /// Packets queued during key exchange that will be sent after NEW_KEYS
+  final List<Uint8List> _rekeyPendingPackets = [];
+
+  /// Sends an SSH packet payload over the transport.
+  ///
+  /// This method packs the [data], calculates padding and MAC, encrypts the payload
+  /// (if encryption has been negotiated), and writes the bytes to the underlying socket.
+  /// If a key exchange is currently in progress, packets are queued and sent after
+  /// the key exchange completes (except for key exchange control messages which bypass the queue).
   void sendPacket(Uint8List data) {
     if (isClosed) {
       throw SSHStateError('Transport is closed');
     }
-    final packetAlign = _encryptCipher == null
-        ? SSHPacket.minAlign
-        : max(SSHPacket.minAlign, _encryptCipher!.blockSize);
 
-    final packet = SSHPacket.pack(data, align: packetAlign);
+    if (_kexInProgress && !_shouldBypassRekeyBuffer(data)) {
+      _rekeyPendingPackets.add(Uint8List.fromList(data));
+      return;
+    }
 
-    if (_encryptCipher == null) {
-      socket.sink.add(packet);
-    } else {
+    // Check if encryption is enabled and if we have MAC types initialized
+    final clientMacType = _clientMacType;
+    final serverMacType = _serverMacType;
+    final macType = isClient ? clientMacType : serverMacType;
+    final localCipherType = isClient ? _clientCipherType : _serverCipherType;
+
+    if (localCipherType != null &&
+        localCipherType.isAead &&
+        _localCipherKey != null &&
+        _localIV != null) {
+      _sendAeadPacket(data, localCipherType);
+      _localPacketSN.increase();
+      return;
+    }
+
+    final isEtm = _encryptCipher != null && macType != null && macType.isEtm;
+
+    // For ETM, we need to handle the packet differently
+    if (isEtm) {
+      // For ETM (Encrypt-Then-MAC):
+      // 1. Keep the packet length in plaintext
+      // 2. Encrypt only the payload (padding length, payload, padding)
+
+      // Calculate the block size for alignment
+      final blockSize = _encryptCipher!.blockSize;
+
+      // Create a custom packet structure for ETM mode
+      // We need to ensure that the payload we're encrypting is a multiple of the block size
+
+      // Calculate the padding length to ensure the total length is a multiple of the block size
+      // We need to account for the 1 byte padding length field
+      final paddingLength = blockSize - ((data.length + 1) % blockSize);
+      // Ensure padding is at least 4 bytes as per SSH spec
+      final adjustedPaddingLength =
+          paddingLength < 4 ? paddingLength + blockSize : paddingLength;
+
+      // Calculate the total packet length (excluding the length field itself)
+      final packetLength = 1 + data.length + adjustedPaddingLength;
+
+      // Create the packet length field (4 bytes)
+      final packetLengthBytes = Uint8List(4);
+      packetLengthBytes.buffer.asByteData().setUint32(0, packetLength);
+
+      // Create the payload to be encrypted (padding length + payload + padding)
+      final payloadToEncrypt = Uint8List(packetLength);
+      payloadToEncrypt[0] = adjustedPaddingLength; // Set padding length
+      payloadToEncrypt.setRange(1, 1 + data.length, data); // Copy data
+
+      // Add random padding
+      for (var i = 0; i < adjustedPaddingLength; i++) {
+        payloadToEncrypt[1 + data.length + i] =
+            (DateTime.now().microsecondsSinceEpoch + i) & 0xFF;
+      }
+
+      // Verify that the payload length is a multiple of the block size
+      if (payloadToEncrypt.length % blockSize != 0) {
+        throw StateError(
+            'Payload length ${payloadToEncrypt.length} is not a multiple of block size $blockSize');
+      }
+
+      // Encrypt the payload
+      final encryptedPayload = _encryptCipher!.processAll(payloadToEncrypt);
+
+      // Calculate MAC on the packet length and encrypted payload
       final mac = _localMac!;
       mac.updateAll(_localPacketSN.value.toUint32());
-      mac.updateAll(packet);
+      mac.updateAll(packetLengthBytes);
+      mac.updateAll(encryptedPayload);
+      final macBytes = mac.finish();
 
+      // Build the final packet: length + encrypted payload + MAC
       final buffer = BytesBuilder(copy: false);
-      buffer.add(_encryptCipher!.processAll(packet));
-      buffer.add(mac.finish());
+      buffer.add(packetLengthBytes);
+      buffer.add(encryptedPayload);
+      buffer.add(macBytes);
 
       socket.sink.add(buffer.takeBytes());
+    } else {
+      // For standard encryption or no encryption:
+      // Use the original packet packing logic
+      final packetAlign = _encryptCipher == null
+          ? SSHPacket.minAlign
+          : max(SSHPacket.minAlign, _encryptCipher!.blockSize);
+
+      final packet = SSHPacket.pack(data, align: packetAlign);
+
+      if (_encryptCipher == null) {
+        socket.sink.add(packet);
+      } else {
+        final mac = _localMac!;
+        final encryptedPacket = _encryptCipher!.processAll(packet);
+
+        final buffer = BytesBuilder(copy: false);
+        buffer.add(encryptedPacket);
+
+        // Calculate MAC on the unencrypted packet
+        mac.updateAll(_localPacketSN.value.toUint32());
+        mac.updateAll(packet);
+        buffer.add(mac.finish());
+
+        socket.sink.add(buffer.takeBytes());
+      }
     }
 
     _localPacketSN.increase();
   }
 
-  void close() {
+  /// Sends a packet encrypted using AEAD (e.g. AES-GCM).
+  ///
+  /// Constructs the packet length and padding, generates random padding bytes,
+  /// encrypts the payload with GCM, and writes the packet to the socket.
+  void _sendAeadPacket(Uint8List data, SSHCipherType cipherType) {
+    final paddingLength =
+        _alignedPaddingLength(data.length, cipherType.blockSize);
+    final packetLength = 1 + data.length + paddingLength;
+
+    final aad = Uint8List(4)..buffer.asByteData().setUint32(0, packetLength);
+
+    final plaintext = Uint8List(packetLength)
+      ..[0] = paddingLength
+      ..setRange(1, 1 + data.length, data);
+
+    for (var i = 0; i < paddingLength; i++) {
+      plaintext[1 + data.length + i] =
+          (DateTime.now().microsecondsSinceEpoch + i) & 0xff;
+    }
+
+    final encrypted = _processAead(
+      key: _localCipherKey!,
+      iv: _localIV!,
+      sequence: _localAeadPacketCount++,
+      aad: aad,
+      input: plaintext,
+      forEncryption: true,
+    );
+
+    final buffer = BytesBuilder(copy: false)
+      ..add(aad)
+      ..add(encrypted);
+
+    socket.sink.add(buffer.takeBytes());
+  }
+
+  /// Computes the correct padding length required to align the total packet size to [align] blocks.
+  int _alignedPaddingLength(int payloadLength, int align) {
+    final paddingLength = align - ((payloadLength + 1) % align);
+    return paddingLength < 4 ? paddingLength + align : paddingLength;
+  }
+
+  /// Encrypts or decrypts [input] using the AES-GCM AEAD block cipher.
+  Uint8List _processAead({
+    required Uint8List key,
+    required Uint8List iv,
+    required int sequence,
+    required Uint8List aad,
+    required Uint8List input,
+    required bool forEncryption,
+  }) {
+    final cipher = GCMBlockCipher(AESEngine());
+    final nonce = _nonceForSequence(iv, sequence);
+    cipher.init(
+      forEncryption,
+      AEADParameters(KeyParameter(key), 128, nonce, aad),
+    );
+    return cipher.process(input);
+  }
+
+  /// Generates the AEAD nonce for a given [iv] and packet [sequence] number.
+  ///
+  /// XORs or appends the sequence number to the IV as specified by the cipher.
+  Uint8List _nonceForSequence(Uint8List iv, int sequence) {
+    if (iv.length != 12) {
+      throw ArgumentError.value(iv, 'iv', 'AEAD IV must be 12 bytes long');
+    }
+
+    final nonce = Uint8List.fromList(iv);
+    final view = ByteData.sublistView(nonce);
+    final counter = view.getUint64(4);
+    view.setUint64(4, counter + sequence);
+    return nonce;
+  }
+
+  /// Closes the SSH transport, cancels the socket subscription, and terminates the connection.
+  Future<void> close() async {
     printDebug?.call('SSHTransport.close');
     if (isClosed) return;
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.complete();
-    socket.destroy();
+    await socket.close();
   }
 
+  /// Closes the SSH transport and completes the [done] future with an [error].
   void closeWithError(SSHError error, [StackTrace? stackTrace]) {
     printDebug?.call('SSHTransport.closeWithError $error');
     if (isClosed) return;
@@ -219,6 +468,12 @@ class SSHTransport {
     socket.destroy();
   }
 
+  /// Force flush any buffered outgoing data to the socket.
+  Future<void> flush() async {
+    await socket.flush();
+  }
+
+  /// Subscribes to the underlying socket stream to handle incoming data and status events.
   void _initSocket() {
     _socketSubscription = socket.stream.listen(
       _onSocketData,
@@ -229,35 +484,60 @@ class SSHTransport {
     socket.done.catchError(_onSocketError);
   }
 
+  /// Callback triggered when new raw bytes are received from the socket.
   void _onSocketData(Uint8List data) {
     _buffer.add(data);
-    try {
-      _processData();
-    } on SSHError catch (e, stackTrace) {
-      closeWithError(e, stackTrace);
-    } catch (e) {
-      rethrow;
-    }
+    _hasNewData = true;
+    _scheduleProcessData();
   }
 
+  /// Callback triggered when an error occurs on the socket stream.
   void _onSocketError(Object error, StackTrace stackTrace) {
     printDebug?.call('SSHTransport._onSocketError($error)');
     closeWithError(SSHSocketError(error), stackTrace);
   }
 
+  /// Callback triggered when the socket stream is closed by the remote peer.
   void _onSocketDone() {
     printDebug?.call('SSHTransport._onSocketDone');
     close();
   }
 
-  void _processData() {
+  void _scheduleProcessData() {
+    if (_isProcessingData || isClosed) {
+      return;
+    }
+
+    _isProcessingData = true;
+    final lengthBefore = _buffer.length;
+    _hasNewData = false;
+
+    _processDataAsync().catchError((error, stackTrace) {
+      if (error is SSHError) {
+        closeWithError(error, stackTrace);
+      } else {
+        closeWithError(SSHInternalError(error), stackTrace);
+      }
+    }).whenComplete(() {
+      _isProcessingData = false;
+      if (_buffer.isNotEmpty && !isClosed) {
+        if (_hasNewData || _buffer.length < lengthBefore) {
+          _scheduleProcessData();
+        }
+      }
+    });
+  }
+
+  Future<void> _processDataAsync() async {
     if (_remoteVersion == null) {
       _processVersionExchange();
-    } else {
-      _processPackets();
+    }
+    if (_remoteVersion != null) {
+      await _processPackets();
     }
   }
 
+  /// Parses the SSH protocol banner/version string sent by the remote host.
   void _processVersionExchange() {
     printDebug?.call('SSHTransport._processVersionExchange');
 
@@ -281,7 +561,9 @@ class SSHTransport {
     }
 
     final versionString = bufferString.substring(0, index);
-    if (!versionString.startsWith('SSH-2.0-')) {
+    // RFC compatibility: SSH-1.99 banners indicate SSH-2 support with SSH-1 fallback.
+    if (!(versionString.startsWith('SSH-2.0-') ||
+        versionString.startsWith('SSH-1.99-'))) {
       socket.sink.add(latin1.encode('Protocol mismatch\r\n'));
       throw SSHHandshakeError('Invalid version: $versionString');
     }
@@ -294,12 +576,12 @@ class SSHTransport {
       _sendKexInit();
     }
 
-    // There maybe more data in the buffer, so process it.
-    _processPackets();
+    // There maybe more data in the buffer, so it will be consumed by the
+    // asynchronous packet processing queue.
   }
 
   /// Process one or more SSH packets queued in [_buffer].
-  void _processPackets() {
+  Future<void> _processPackets() async {
     printDebug?.call('SSHTransport._processPackets');
 
     while (_buffer.isNotEmpty && !isClosed) {
@@ -312,7 +594,7 @@ class SSHTransport {
       //   throw SSHPacketError('Packet too long: ${payload.length}');
       // }
 
-      _handleMessage(payload);
+      await _handleMessage(payload);
 
       _remotePacketSN.increase();
     }
@@ -322,11 +604,12 @@ class SSHTransport {
   /// WITHOUT `packet length`, `padding length`, `padding` and `MAC`. Returns
   /// `null` if there is not enough data in the buffer to read the packet.
   Uint8List? _consumePacket() {
-    return _decryptCipher == null
+    return (_decryptCipher == null && _remoteCipherKey == null)
         ? _consumeClearTextPacket()
         : _consumeEncryptedPacket();
   }
 
+  /// Consumes and returns a single unencrypted packet payload from the buffer.
   Uint8List? _consumeClearTextPacket() {
     printDebug?.call('SSHTransport._consumeClearTextPacket');
 
@@ -349,43 +632,180 @@ class SSHTransport {
     return Uint8List.sublistView(packet, 5, packet.length - paddingLength);
   }
 
+  /// Consumes, decrypts, and returns a single encrypted packet payload from the buffer.
   Uint8List? _consumeEncryptedPacket() {
     printDebug?.call('SSHTransport._consumeEncryptedPacket');
+
+    final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
+    if (remoteCipherType != null &&
+        remoteCipherType.isAead &&
+        _remoteCipherKey != null &&
+        _remoteIV != null) {
+      return _consumeAeadPacket(remoteCipherType);
+    }
 
     final blockSize = _decryptCipher!.blockSize;
     if (_buffer.length < blockSize) {
       return null;
     }
 
-    if (_decryptBuffer.isEmpty) {
-      final firstBlock = _buffer.consume(blockSize);
-      _decryptBuffer.add(_decryptCipher!.process(firstBlock));
-    }
-
-    final packetLength = SSHPacket.readPacketLength(_decryptBuffer.data);
-    _verifyPacketLength(packetLength);
-
+    final macType = isClient ? _serverMacType! : _clientMacType!;
+    final isEtm = macType.isEtm;
     final macLength = _remoteMac!.macSize;
-    if (_buffer.length + _decryptBuffer.length < 4 + packetLength + macLength) {
+
+    if (isEtm) {
+      // For ETM (Encrypt-Then-MAC) algorithms, the packet length is in plaintext
+      // followed by the encrypted payload and then the MAC
+
+      // We need at least 4 bytes to read the packet length
+      if (_buffer.length < 4) {
+        return null;
+      }
+
+      // Read the packet length from the plaintext data
+      final packetLength = SSHPacket.readPacketLength(_buffer.data);
+      _verifyPacketLength(packetLength);
+
+      // Make sure we have enough data for the entire packet and MAC
+      if (_buffer.length < 4 + packetLength + macLength) {
+        return null;
+      }
+
+      // Get the packet length bytes
+      final packetLengthBytes = _buffer.view(0, 4);
+
+      // Get the encrypted payload and MAC
+      final encryptedPayload = _buffer.view(4, packetLength);
+      final mac = _buffer.view(4 + packetLength, macLength);
+
+      // Verify the MAC on the packet length and encrypted payload
+      final packetForMac = Uint8List(4 + packetLength);
+      packetForMac.setRange(0, 4, packetLengthBytes);
+      packetForMac.setRange(4, 4 + packetLength, encryptedPayload);
+      _verifyPacketMac(packetForMac, mac, isEncrypted: true);
+
+      // Consume the packet and MAC from the buffer
+      _buffer.consume(4 + packetLength + macLength);
+
+      // Ensure the encrypted payload length is a multiple of the block size
+      if (encryptedPayload.length % blockSize != 0) {
+        throw SSHPacketError(
+          'Encrypted payload length ${encryptedPayload.length} is not a multiple of block size $blockSize',
+        );
+      }
+
+      // Decrypt the payload
+      final decryptedPayload = _decryptCipher!.processAll(encryptedPayload);
+
+      // Process the decrypted payload
+      final paddingLength = decryptedPayload[0];
+
+      // Verify that the padding length is valid
+      if (paddingLength < 4) {
+        throw SSHPacketError(
+          'Padding length too small: $paddingLength (minimum is 4)',
+        );
+      }
+
+      if (paddingLength >= packetLength) {
+        throw SSHPacketError(
+          'Padding length too large: $paddingLength (packet length is $packetLength)',
+        );
+      }
+
+      final payloadLength = packetLength - paddingLength - 1;
+      if (payloadLength < 0) {
+        throw SSHPacketError(
+          'Invalid payload length: $payloadLength (packet length: $packetLength, padding length: $paddingLength)',
+        );
+      }
+
+      // Skip the padding length byte and extract the payload
+      return Uint8List.sublistView(decryptedPayload, 1, 1 + payloadLength);
+    } else {
+      // For standard MAC algorithms, decrypt the packet first, then verify the MAC
+
+      if (_decryptBuffer.isEmpty) {
+        final firstBlock = _buffer.consume(blockSize);
+        _decryptBuffer.add(_decryptCipher!.process(firstBlock));
+      }
+
+      final packetLength = SSHPacket.readPacketLength(_decryptBuffer.data);
+      _verifyPacketLength(packetLength);
+
+      if (_buffer.length + _decryptBuffer.length <
+          4 + packetLength + macLength) {
+        return null;
+      }
+
+      while (_decryptBuffer.length < 4 + packetLength) {
+        final block = _buffer.consume(blockSize);
+        _decryptBuffer.add(_decryptCipher!.process(block));
+      }
+
+      final packet = _decryptBuffer.consume(packetLength + 4);
+      final paddingLength = SSHPacket.readPaddingLength(packet);
+      final payloadLength = packetLength - paddingLength - 1;
+      _verifyPacketPadding(payloadLength, paddingLength);
+
+      final mac = _buffer.consume(macLength);
+      _verifyPacketMac(packet, mac, isEncrypted: false);
+
+      return Uint8List.sublistView(packet, 5, packet.length - paddingLength);
+    }
+  }
+
+  /// Consumes and decrypts an AEAD-encrypted packet.
+  Uint8List? _consumeAeadPacket(SSHCipherType cipherType) {
+    if (_buffer.length < 4) {
       return null;
     }
 
-    while (_decryptBuffer.length < 4 + packetLength) {
-      final block = _buffer.consume(blockSize);
-      _decryptBuffer.add(_decryptCipher!.process(block));
+    final packetLength = SSHPacket.readPacketLength(_buffer.data);
+    _verifyPacketLength(packetLength);
+
+    final tagLength = cipherType.aeadTagSize;
+    if (_buffer.length < 4 + packetLength + tagLength) {
+      return null;
     }
 
-    final packet = _decryptBuffer.consume(packetLength + 4);
-    final paddingLength = SSHPacket.readPaddingLength(packet);
+    final aad = _buffer.consume(4);
+    final ciphertext = _buffer.consume(packetLength);
+    final tag = _buffer.consume(tagLength);
+
+    final encryptedInput = Uint8List(packetLength + tagLength)
+      ..setRange(0, packetLength, ciphertext)
+      ..setRange(packetLength, packetLength + tagLength, tag);
+
+    late Uint8List plaintext;
+    try {
+      plaintext = _processAead(
+        key: _remoteCipherKey!,
+        iv: _remoteIV!,
+        sequence: _remoteAeadPacketCount++,
+        aad: aad,
+        input: encryptedInput,
+        forEncryption: false,
+      );
+    } on InvalidCipherTextException {
+      throw SSHPacketError('AEAD authentication failed');
+    }
+
+    final paddingLength = plaintext[0];
     final payloadLength = packetLength - paddingLength - 1;
-    _verifyPacketPadding(payloadLength, paddingLength);
 
-    final mac = _buffer.consume(macLength);
-    _verifyPacketMac(packet, mac);
+    final minPaddingLength =
+        _alignedPaddingLength(payloadLength, cipherType.blockSize);
+    if (paddingLength < minPaddingLength) {
+      throw SSHPacketError(
+        'Invalid padding length: $paddingLength, expected: $minPaddingLength',
+      );
+    }
 
-    return Uint8List.sublistView(packet, 5, packet.length - paddingLength);
+    return Uint8List.sublistView(plaintext, 1, 1 + payloadLength);
   }
 
+  /// Validates that the parsed packet length is within acceptable bounds.
   void _verifyPacketLength(int packetLength) {
     if (packetLength > SSHPacket.maxLength) {
       throw SSHPacketError('Packet too long: $packetLength');
@@ -413,14 +833,33 @@ class SSHTransport {
 
   /// Verifies that the MAC of the packet is correct. Throws [SSHPacketError]
   /// if the MAC is incorrect.
-  void _verifyPacketMac(Uint8List payload, Uint8List actualMac) {
+  ///
+  /// For ETM (Encrypt-Then-MAC) algorithms, the MAC is calculated on the packet length and encrypted payload.
+  /// For standard MAC algorithms, the MAC is calculated on the unencrypted packet.
+  void _verifyPacketMac(Uint8List payload, Uint8List actualMac,
+      {bool isEncrypted = false}) {
     final macSize = _remoteMac!.macSize;
     if (actualMac.length != macSize) {
       throw ArgumentError.value(actualMac, 'mac', 'Invalid MAC size');
     }
 
+    final macType = isClient ? _serverMacType! : _clientMacType!;
+    final isEtm = macType.isEtm;
+
     _remoteMac!.updateAll(_remotePacketSN.value.toUint32());
-    _remoteMac!.updateAll(payload);
+
+    // For ETM algorithms, the MAC is calculated on the packet length and encrypted payload
+    // For standard MAC algorithms, the MAC is calculated on the unencrypted packet
+    if (isEtm && isEncrypted) {
+      _remoteMac!.updateAll(payload);
+    } else if (!isEtm && !isEncrypted) {
+      _remoteMac!.updateAll(payload);
+    } else {
+      throw SSHPacketError(
+        'MAC algorithm mismatch: isEtm=$isEtm, isEncrypted=$isEncrypted',
+      );
+    }
+
     final expectedMac = _remoteMac!.finish();
 
     if (!expectedMac.equals(actualMac)) {
@@ -430,6 +869,7 @@ class SSHTransport {
     }
   }
 
+  /// Initiates the SSH version exchange handshake.
   void _startHandshake() {
     socket.sink.add(latin1.encode('$_localVersion\r\n'));
 
@@ -438,19 +878,30 @@ class SSHTransport {
     }
   }
 
+  /// Derives and applies the encryption and MAC keys for local-to-remote communication.
   void _applyLocalKeys() {
     final cipherType = isClient ? _clientCipherType : _serverCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
 
+    _localCipherKey = _deriveKey(
+      isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
+      cipherType.keySize,
+    );
+    _localIV = _deriveKey(
+      isClient ? SSHDeriveKeyType.clientIV : SSHDeriveKeyType.serverIV,
+      cipherType.ivSize,
+    );
+
+    if (cipherType.isAead) {
+      _encryptCipher = null;
+      _localMac = null;
+      _localAeadPacketCount = 0;
+      return;
+    }
+
     _encryptCipher = cipherType.createCipher(
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
-        cipherType.keySize,
-      ),
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.clientIV : SSHDeriveKeyType.serverIV,
-        cipherType.ivSize,
-      ),
+      _localCipherKey!,
+      _localIV!,
       forEncryption: true,
     );
 
@@ -465,19 +916,30 @@ class SSHTransport {
     _localMac = macType.createMac(macKey);
   }
 
+  /// Derives and applies the decryption and MAC keys for remote-to-local communication.
   void _applyRemoteKeys() {
     final cipherType = isClient ? _serverCipherType : _clientCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
 
+    _remoteCipherKey = _deriveKey(
+      isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
+      cipherType.keySize,
+    );
+    _remoteIV = _deriveKey(
+      isClient ? SSHDeriveKeyType.serverIV : SSHDeriveKeyType.clientIV,
+      cipherType.ivSize,
+    );
+
+    if (cipherType.isAead) {
+      _decryptCipher = null;
+      _remoteMac = null;
+      _remoteAeadPacketCount = 0;
+      return;
+    }
+
     _decryptCipher = cipherType.createCipher(
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
-        cipherType.keySize,
-      ),
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.serverIV : SSHDeriveKeyType.clientIV,
-        cipherType.ivSize,
-      ),
+      _remoteCipherKey!,
+      _remoteIV!,
       forEncryption: false,
     );
 
@@ -491,13 +953,14 @@ class SSHTransport {
     _remoteMac = macType.createMac(macKey);
   }
 
+  /// Derives a cryptographic key/IV of [keySize] bytes using KDF rules for the given [keyType].
   Uint8List _deriveKey(SSHDeriveKeyType keyType, int keySize) {
     return SSHKexUtils.deriveKey(
       digest: _kexType!.createDigest(),
       sharedSecret: _sharedSecret!,
       exchangeHash: _exchangeHash!,
       keyType: keyType,
-      sessionId: _sessionId!,
+      sessionId: sessionId!,
       keySize: keySize,
     );
   }
@@ -510,7 +973,7 @@ class SSHTransport {
     required Uint8List publicKey,
   }) {
     final writer = SSHMessageWriter();
-    writer.writeString(_sessionId!);
+    writer.writeString(sessionId!);
     writer.writeUint8(SSH_Message_Userauth_Request.messageId);
     writer.writeUtf8(username);
     writer.writeUtf8(service);
@@ -521,6 +984,7 @@ class SSHTransport {
     return writer.takeBytes();
   }
 
+  /// Verifies the server's public host key signature against the computed exchange hash.
   bool _verifyHostkey({
     required Uint8List keyBytes,
     required Uint8List signatureBytes,
@@ -550,8 +1014,19 @@ class SSHTransport {
     }
   }
 
+  /// Sends the KEXINIT message to negotiate algorithms with the remote peer.
   void _sendKexInit() {
     printDebug?.call('SSHTransport._sendKexInit');
+
+    // Don't start a new key exchange when one is already in progress
+    if (_kexInProgress && _sentKexInit) {
+      printDebug?.call('Key exchange already in progress, ignoring');
+      return;
+    }
+
+    // Mark that a new key-exchange round has started from our side.
+    _kexInProgress = true;
+    _sentKexInit = true;
 
     final message = SSH_Message_KexInit(
       kexAlgorithms: algorithms.kex.toNameList(),
@@ -593,6 +1068,7 @@ class SSHTransport {
     printTrace?.call('-> $socket: $message');
   }
 
+  /// Sends the Diffie-Hellman Group Exchange Request message.
   void _sendKexDHGexRequest() {
     printDebug?.call('SSHTransport._sendKexDHGexRequest');
 
@@ -606,6 +1082,7 @@ class SSHTransport {
     printTrace?.call('-> $socket: $message');
   }
 
+  /// Sends the Diffie-Hellman Group Exchange Init message.
   void _sendKexDHGexInit() {
     printDebug?.call('SSHTransport._sendKexDHGexInit');
 
@@ -628,7 +1105,8 @@ class SSHTransport {
     sendPacket(message.encode());
   }
 
-  void _handleMessage(Uint8List message) {
+  /// Dispatches the incoming decrypted packet payload to the appropriate message handler.
+  Future<void> _handleMessage(Uint8List message) async {
     final messageId = SSHMessage.readMessageId(message);
     switch (messageId) {
       case SSH_Message_KexInit.messageId:
@@ -643,8 +1121,21 @@ class SSHTransport {
     }
   }
 
-  void _handleMessageKexInit(Uint8List payload) {
+  /// Processes the KEXINIT message received from the remote peer and negotiates algorithms.
+  Future<void> _handleMessageKexInit(Uint8List payload) async {
     printDebug?.call('SSHTransport._handleMessageKexInit');
+
+    // If this message initiates a new key-exchange round from the remote
+    // side, we MUST respond with our own KEXINIT (RFC 4253 §7.1).
+    if (!_kexInProgress) {
+      // Start a new exchange initiated by the peer.
+      _kexInProgress = true;
+    }
+
+    if (!_sentKexInit) {
+      // We have not sent our KEXINIT for this round yet, do it now.
+      _sendKexInit();
+    }
 
     final message = SSH_Message_KexInit.decode(payload);
     printTrace?.call('<- $socket: $message');
@@ -693,10 +1184,10 @@ class SSHTransport {
     if (_serverCipherType == null) {
       throw StateError('No matching server cipher algorithm');
     }
-    if (_clientMacType == null) {
+    if (_clientMacType == null && !_clientCipherType!.isAead) {
       throw StateError('No matching client MAC algorithm');
     }
-    if (_serverMacType == null) {
+    if (_serverMacType == null && !_serverCipherType!.isAead) {
       throw StateError('No matching server MAC algorithm');
     }
 
@@ -709,23 +1200,24 @@ class SSHTransport {
 
     switch (_kexType) {
       case SSHKexType.x25519:
-        _kex = SSHKexX25519();
+      case SSHKexType.x25519Rfc:
+        _kex = await SSHKexX25519.createAsync();
         break;
       case SSHKexType.nistp256:
-        _kex = SSHKexNist.p256();
+        _kex = await SSHKexNist.p256Async();
         break;
       case SSHKexType.nistp384:
-        _kex = SSHKexNist.p384();
+        _kex = await SSHKexNist.p384Async();
         break;
       case SSHKexType.nistp521:
-        _kex = SSHKexNist.p521();
+        _kex = await SSHKexNist.p521Async();
         break;
       case SSHKexType.dh14Sha1:
       case SSHKexType.dh14Sha256:
-        _kex = SSHKexDH.group14();
+        _kex = await SSHKexDH.group14Async();
         break;
       case SSHKexType.dh1Sha1:
-        _kex = SSHKexDH.group1();
+        _kex = await SSHKexDH.group1Async();
         break;
       case SSHKexType.dhGexSha1:
       case SSHKexType.dhGexSha256:
@@ -743,7 +1235,7 @@ class SSHTransport {
   /// When client receives [SSH_Message_KexECDH_Reply], it should verify the
   /// server's signature with the server's public key. Then send NEW_KEYS
   /// message back to the server.
-  void _handleMessageKexReply(Uint8List payload) {
+  Future<void> _handleMessageKexReply(Uint8List payload) async {
     printDebug?.call('SSHTransport._handleMessageKexReply');
     if (isServer) throw SSHStateError('Unexpected KEX_REPLY');
 
@@ -777,7 +1269,7 @@ class SSHTransport {
       hostSignature = message.signature;
       serverKexKey = encodeBigInt(message.f);
       clientKexKey = encodeBigInt(kex.e);
-      sharedSecret = kex.computeSecret(message.f);
+      sharedSecret = await kex.computeSecretAsync(message.f);
     } else if (kex is SSHKexECDH) {
       final message = SSH_Message_KexECDH_Reply.decode(payload);
       printTrace?.call('<- $socket: $message');
@@ -785,7 +1277,13 @@ class SSHTransport {
       hostSignature = message.signature;
       serverKexKey = message.ecdhPublicKey;
       clientKexKey = kex.publicKey;
-      sharedSecret = kex.computeSecret(message.ecdhPublicKey);
+      if (kex is SSHKexX25519) {
+        sharedSecret = await kex.computeSecretAsync(message.ecdhPublicKey);
+      } else if (kex is SSHKexNist) {
+        sharedSecret = await kex.computeSecretAsync(message.ecdhPublicKey);
+      } else {
+        sharedSecret = kex.computeSecret(message.ecdhPublicKey);
+      }
     } else {
       throw UnimplementedError('$kex');
     }
@@ -803,18 +1301,20 @@ class SSHTransport {
       sharedSecret: sharedSecret,
     );
 
-    final verified = _verifyHostkey(
-      keyBytes: hostkey,
-      signatureBytes: hostSignature,
-      exchangeHash: exchangeHash,
-    );
-    if (!verified) throw SSHHostkeyError('Signature verification failed');
+    if (!disableHostkeyVerification) {
+      final verified = _verifyHostkey(
+        keyBytes: hostkey,
+        signatureBytes: hostSignature,
+        exchangeHash: exchangeHash,
+      );
+      if (!verified) throw SSHHostkeyError('Signature verification failed');
+    }
 
     _exchangeHash = exchangeHash;
     _sessionId ??= exchangeHash;
     _sharedSecret = sharedSecret;
 
-    final fingerprint = MD5Digest().process(hostkey);
+    final fingerprint = _hostkeyFingerprint(hostkey);
 
     if (_hostkeyVerified) {
       _sendNewKeys();
@@ -823,40 +1323,93 @@ class SSHTransport {
     }
 
     final userVerified = onVerifyHostKey != null
-        ? onVerifyHostKey!(_hostkeyType!.name, fingerprint)
+        ? await Future.value(onVerifyHostKey!(_hostkeyType!.name, fingerprint))
         : true;
 
-    Future.value(userVerified).then(
-      (verified) {
-        if (!verified) {
-          closeWithError(SSHHostkeyError('Hostkey verification failed'));
-        } else {
-          _hostkeyVerified = true;
-          _sendNewKeys();
-          _applyLocalKeys();
-          onReady?.call();
-        }
-      },
-      onError: (error) {
-        closeWithError(error);
-      },
-    );
+    if (!userVerified) {
+      closeWithError(SSHHostkeyError('Hostkey verification failed'));
+      return;
+    }
+
+    _hostkeyVerified = true;
+    _sendNewKeys();
+    _applyLocalKeys();
+    onReady?.call();
   }
 
-  void _handleMessageKexGexReply(Uint8List payload) {
+  /// Processes the Group Exchange Reply (GEX Group) message containing Diffie-Hellman params.
+  Future<void> _handleMessageKexGexReply(Uint8List payload) async {
     printDebug?.call('SSHTransport._handleMessageKexGexReply');
     if (isServer) throw SSHStateError('Unexpected KEX_GEX_REPLY');
 
     final message = SSH_Message_KexDH_GexGroup.decode(payload);
     printTrace?.call('<- $socket: $message');
 
-    _kex = SSHKexDH(p: message.p, g: message.g, secretBits: 256);
+    _kex =
+        await SSHKexDH.createAsync(p: message.p, g: message.g, secretBits: 256);
     _sendKexDHGexInit();
   }
 
-  void _handleMessageNewKeys(Uint8List message) {
+  /// Handles the NEWKEYS message, activating the remote decryption keys and flushing queued packets.
+  Future<void> _handleMessageNewKeys(Uint8List message) async {
     printDebug?.call('SSHTransport._handleMessageNewKeys');
     printTrace?.call('<- $socket: SSH_Message_NewKeys');
+
     _applyRemoteKeys();
+
+    // Key exchange round finished.
+    _kexInProgress = false;
+    _sentKexInit = false;
+    _kex = null;
+
+    // Flush any pending packets
+    final pending = List<Uint8List>.from(_rekeyPendingPackets);
+    _rekeyPendingPackets.clear();
+    for (final packet in pending) {
+      sendPacket(packet);
+    }
+  }
+
+  /// Initiates a client-side re-key operation. This can be called
+  /// by client code to refresh session keys when needed.
+  void rekey() {
+    printDebug?.call('SSHTransport.rekey');
+    if (_kexInProgress) {
+      printDebug
+          ?.call('Key exchange already in progress, ignoring rekey request');
+      return;
+    }
+    _sendKexInit();
+  }
+
+  /// Determines if a packet should bypass the rekey buffer.
+  ///
+  /// During key exchange, most packets should be buffered until the exchange
+  /// is complete. However, key exchange packets themselves and transport layer
+  /// control messages (like disconnect) need to be sent immediately.
+  ///
+  /// Per RFC 4253, the following message types bypass the buffer:
+  ///
+  ///  /// Critical transport messages (1-4):
+  /// - 1: [SSH_Message_Disconnect]
+  /// - 2: [SSH_Message_Ignore]
+  /// - 3: [SSH_Message_Unimplemented]
+  /// - 4: [SSH_Message_Debug]
+  ///
+  /// Key exchange messages (20-49):
+  /// - 20: [SSH_Message_KexInit]
+  /// - 21: [SSH_Message_NewKeys]
+  /// - 30: [SSH_Message_KexDH_Init]/[SSH_Message_KexECDH_Init]
+  /// - 31: [SSH_Message_KexDH_Reply]/[SSH_Message_KexECDH_Reply]/[SSH_Message_KexDH_GexGroup]
+  /// - 32: [SSH_Message_KexDH_GexInit]
+  /// - 33: [SSH_Message_KexDH_GexReply]
+  /// - 34: [SSH_Message_KexDH_GexRequest]
+  ///
+  ///
+  bool _shouldBypassRekeyBuffer(Uint8List data) {
+    if (data.isEmpty) return false;
+
+    final messageId = data[0];
+    return (messageId >= 20 && messageId <= 49) || messageId <= 4;
   }
 }
